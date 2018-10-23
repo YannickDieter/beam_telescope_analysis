@@ -827,7 +827,7 @@ def cluster_hits(dut, input_hit_file, output_cluster_file=None, input_mask_file=
             if hits[i].frame < min_frame:
                 min_frame = hits[i].frame
 
-        if max_col - min_col < 8 and max_row - min_row < 8:
+        if max_col - min_col < 8 and max_row - min_row < 8: # cluster shape is coded with a z-function (wikipedia)
             # make 8x8 array
             col_base = 7 + min_col - center_col
             row_base = 7 + min_row - center_row
@@ -878,13 +878,15 @@ def cluster_hits(dut, input_hit_file, output_cluster_file=None, input_mask_file=
     def end_of_event_function(hits, clusters, start_event_hit_index, stop_event_hit_index, start_event_cluster_index, stop_event_cluster_index):
         for i in range(start_event_cluster_index, stop_event_cluster_index):
             clusters[i]['n_cluster'] = hits["n_cluster"][start_event_hit_index]
+            clusters[i]['trigger_time_stamp'] = hits["trigger_time_stamp"][start_event_hit_index]
 
     if use_positions:
         hit_dtype = np.dtype([
             ('event_number', '<i8'),
+            ('trigger_time_stamp', '<u8'),
             ('x', '<f8'),
             ('y', '<f8'),
-            ('charge', '<u2'),
+            ('charge', '<u2'),  # TODO: change that
             ('frame', '<u1'),
             ('cluster_ID', '<i2'),
             ('is_seed', '<u1'),
@@ -901,6 +903,7 @@ def cluster_hits(dut, input_hit_file, output_cluster_file=None, input_mask_file=
             'cluster_ID': 'ID'}
         cluster_dtype = np.dtype([
             ('event_number', '<i8'),
+            ('trigger_time_stamp', '<u8'),
             ('cluster_ID', '<u2'),
             ('n_hits', '<u4'),
             ('charge', '<f4'),
@@ -912,6 +915,8 @@ def cluster_hits(dut, input_hit_file, output_cluster_file=None, input_mask_file=
     else:
         hit_dtype = np.dtype([
             ('event_number', '<i8'),
+            ('trigger_time_stamp', '<u8'),
+            ('frame', '<u4'),
             ('column', '<u2'),
             ('row', '<u2'),
             ('charge', '<u2'),
@@ -925,6 +930,7 @@ def cluster_hits(dut, input_hit_file, output_cluster_file=None, input_mask_file=
             'cluster_ID': 'ID'}
         cluster_dtype = np.dtype([
             ('event_number', '<i8'),
+            ('trigger_time_stamp', '<u8'),
             ('cluster_ID', '<u2'),
             ('n_hits', '<u4'),
             ('charge', '<f4'),
@@ -1479,7 +1485,7 @@ def merge_cluster_data(telescope_configuration, input_cluster_files, output_merg
                 use_positions.append(False)
 
     # Create result array description, depends on the number of DUTs
-    description = [('event_number', np.int64)]
+    description = [('event_number', np.int64), ('trigger_time_stamp', np.int64)]
     for dimension in ['x', 'y', 'z']:
         for index_dut in range(n_duts):
             description.append(('%s_dut_%d' % (dimension, index_dut), np.float64))
@@ -1576,6 +1582,7 @@ def merge_cluster_data(telescope_configuration, input_cluster_files, output_merg
                 merged_cluster_array['cluster_ID_dut_0'][selection] = mapped_clusters_dut_0['cluster_ID'][selection]
                 merged_cluster_array['cluster_shape_dut_0'][selection] = mapped_clusters_dut_0['cluster_shape'][selection]
                 merged_cluster_array['n_cluster_dut_0'][selection] = mapped_clusters_dut_0['n_cluster'][selection]
+                merged_cluster_array['trigger_time_stamp'][selection] = mapped_clusters_dut_0['trigger_time_stamp'][selection]
 
                 # Fill result array with other DUT data
                 # Second loop: get the cluster from all files and merge them to the common event number
@@ -1615,6 +1622,8 @@ def merge_cluster_data(telescope_configuration, input_cluster_files, output_merg
                             merged_cluster_array['cluster_ID_dut_%d' % (dut_index)][selection] = mapped_clusters_dut['cluster_ID'][selection]
                             merged_cluster_array['cluster_shape_dut_%d' % (dut_index)][selection] = mapped_clusters_dut['cluster_shape'][selection]
                             merged_cluster_array['n_cluster_dut_%d' % (dut_index)][selection] = mapped_clusters_dut['n_cluster'][selection]
+                            merged_cluster_array['trigger_time_stamp'][selection] = mapped_clusters_dut['trigger_time_stamp'][selection]
+
                 # calculate hit flags
                 for dut_index in range(n_duts):
                     merged_cluster_array['hit_flag'] += np.isfinite(merged_cluster_array['x_dut_%d' % dut_index]).astype(merged_cluster_array['hit_flag'].dtype) << dut_index
