@@ -916,11 +916,10 @@ def cluster_hits(dut, input_hit_file, output_cluster_file=None, input_mask_file=
         hit_dtype = np.dtype([
             ('event_number', '<i8'),
             ('trigger_time_stamp', '<i8'),
-            ('frame', '<u4'),
+            ('frame', '<u1'),
             ('column', '<u2'),
             ('row', '<u2'),
             ('charge', '<u2'),
-            ('frame', '<u1'),
             ('cluster_ID', '<i2'),
             ('is_seed', '<u1'),
             ('cluster_size', '<u4'),
