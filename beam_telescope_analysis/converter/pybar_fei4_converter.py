@@ -27,7 +27,10 @@ beam_telescope_analysis_dtype = np.dtype([
     ('frame', np.uint8),
     ('column', np.uint16),
     ('row', np.uint16),
-    ('charge', np.uint16)])
+    ('charge', np.uint16),
+    ('tdc_value', np.uint16),
+    ('tdc_timestamp', np.uint16),
+    ('tdc_status', np.uint8)])
 
 
 def process_dut(raw_data_file, output_filename=None, trigger_data_format=0):
@@ -82,7 +85,7 @@ def analyze_raw_data(input_filename, output_filename=None, trigger_data_format=0
         analyze_raw_data.create_cluster_size_hist = True
         analyze_raw_data.create_cluster_tot_hist = True
         analyze_raw_data.align_at_trigger = True
-        analyze_raw_data.fei4b = False
+        analyze_raw_data.fei4b = True
         analyze_raw_data.create_empty_event_hits = False
         # analyze_raw_data.n_bcid = 16
         # analyze_raw_data.max_tot_value = 13
@@ -138,6 +141,9 @@ def format_hit_table(input_filename, output_filename=None, chunk_size=1000000):
                 hits_data_formatted['column'] = hits_chunk['column']
                 hits_data_formatted['row'] = hits_chunk['row']
                 hits_data_formatted['charge'] = hits_chunk['tot']
+                hits_data_formatted['tdc_value'] = 0
+                hits_data_formatted['tdc_timestamp'] = 0
+                hits_data_formatted['tdc_status'] = 0
                 output_hits_table.append(hits_data_formatted)
                 output_hits_table.flush()
 

@@ -22,7 +22,10 @@ beam_telescope_analysis_dtype = np.dtype([
     ('frame', np.uint8),
     ('column', np.uint16),
     ('row', np.uint16),
-    ('charge', np.uint16)])
+    ('charge', np.uint16),
+    ('tdc_value', np.uint16),
+    ('tdc_timestamp', np.uint16),
+    ('tdc_status', np.uint8)])
 
 
 def process_dut(raw_data_file, output_filenames=None, trigger_data_format=2, timing_offset=None):
@@ -107,9 +110,15 @@ def format_hit_table(input_filename, output_filenames=None, chunk_size=1000000):
                     hits_data_formatted['column'] = hits_chunk[selected_hits]['column'] + 1
                     hits_data_formatted['row'] = hits_chunk[selected_hits]['row'] + 1
                     hits_data_formatted['charge'] = 0
+                    hits_data_formatted['tdc_value'] = 0
+                    hits_data_formatted['tdc_timestamp'] = 0
+                    hits_data_formatted['tdc_status'] = 0
                     # Append data to table
                     output_hits_table.append(hits_data_formatted)
                     output_hits_table.flush()
+
+    # Delete interpreted file (not needed anymore)
+    os.remove(input_filename)
 
     return output_filenames
 

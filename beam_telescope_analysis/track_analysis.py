@@ -611,6 +611,12 @@ def fit_tracks(telescope_configuration, input_track_candidates_file, output_trac
     if method == "kalman" and not particle_mass:
         raise ValueError('Particle mass not given (in MeV).')
 
+    if method == "fit":
+        method_str = 'Straight Line Fit'
+    if method == "kalman":
+        method_str = 'Kalman Filter'
+    logging.info('=== Fitting tracks of %d DUTs (using %s)===' % (n_duts, method_str))
+
     if output_tracks_file is None:
         output_tracks_file = os.path.join(os.path.dirname(input_track_candidates_file), 'Tracks_%s.h5' % method.title())
     if plot:
@@ -819,7 +825,8 @@ def fit_tracks(telescope_configuration, input_track_candidates_file, output_trac
                     # NOTE: this value has a significant impact on CPU processing time
                     if method == "kalman":
                         # increase minimum track hits requirement for Kalman fit to reduce CPU processing time
-                        select_fit_tracks = (analysis_utils.number_of_set_bits(track_candidates_chunk['hit_flag'] & dut_fit_mask) >= min(3, actual_min_track_hits))
+                        select_fit_tracks = (analysis_utils.number_of_set_bits(track_candidates_chunk['hit_flag'] & dut_fit_mask) >= actual_min_track_hits)
+                        # select_fit_tracks = (analysis_utils.number_of_set_bits(track_candidates_chunk['hit_flag'] & dut_fit_mask) >= min(3, actual_min_track_hits))
                     else:
                         select_fit_tracks = (analysis_utils.number_of_set_bits(track_candidates_chunk['hit_flag'] & dut_fit_mask) >= 2)
                     # Select tracks that will be stored
@@ -972,13 +979,16 @@ def fit_tracks(telescope_configuration, input_track_candidates_file, output_trac
                 # print "total_n_events_stored", total_n_events_stored
                 fitted_duts.extend(actual_fit_duts)
 
-                plot_utils.plot_fit_tracks_statistics(
-                    telescope=telescope,
-                    fit_duts=actual_fit_duts,
-                    chunk_indices=chunk_indices,
-                    chunk_stats=chunk_stats,
-                    dut_stats=dut_stats,
-                    output_pdf=output_pdf)
+                try:
+                    plot_utils.plot_fit_tracks_statistics(
+                        telescope=telescope,
+                        fit_duts=actual_fit_duts,
+                        chunk_indices=chunk_indices,
+                        chunk_stats=chunk_stats,
+                        dut_stats=dut_stats,
+                        output_pdf=output_pdf)
+                except Exception as e:
+                    print(e)
 
     pool.close()
     pool.join()
@@ -1044,7 +1054,7 @@ def store_track_data(out_file_h5, track_candidates_chunk, select_fit_tracks, sel
                 rotation_alpha=dut.rotation_alpha,
                 rotation_beta=dut.rotation_beta,
                 rotation_gamma=dut.rotation_gamma)
-        elif method == "kalman":
+        elif method in ["kalman", "ckf"]:
             # Set the offset to the track intersection with the tilted plane
             intersections_global = geometry_utils.get_line_intersections_with_dut(
                 line_origins=offsets[:, dut_index],
@@ -1340,6 +1350,9 @@ def create_results_array(n_duts, dut_offsets, dut_slopes, track_chi2s, quality_f
         tracks_array['cluster_ID_dut_%d' % index_dut] = track_candidates_chunk['cluster_ID_dut_%d' % index_dut]
         tracks_array['cluster_shape_dut_%d' % index_dut] = track_candidates_chunk['cluster_shape_dut_%d' % index_dut]
         tracks_array['n_cluster_dut_%d' % index_dut] = track_candidates_chunk['n_cluster_dut_%d' % index_dut]
+        tracks_array['tdc_value_dut_%d' % index_dut] = track_candidates_chunk['tdc_value_dut_%d' % index_dut]
+        tracks_array['tdc_timestamp_dut_%d' % index_dut] = track_candidates_chunk['tdc_timestamp_dut_%d' % index_dut]
+        tracks_array['tdc_status_dut_%d' % index_dut] = track_candidates_chunk['tdc_status_dut_%d' % index_dut]
 
     if keep_data:
         for index, dimension in enumerate(['x', 'y', 'z']):
@@ -1730,3 +1743,1231 @@ def _kalman_fit_3d(dut_planes, z_sorted_dut_indices, hits, thetas, select_fit_du
         logging.warning('Smoothed state estimates contain invalid values (NaNs). Check input of Kalman Filter.')
 
     return smoothed_state_estimates, x_err, y_err, chi2
+
+def combinatorial_kalman_filter(telescope_configuration, input_merged_file, output_tracks_file, max_events=None, select_duts=None, select_hit_duts=None, select_fit_duts=None, exclude_dut_hit=True, min_track_hits=None, beam_energy=None, particle_mass=None, quality_distances=(250.0, 250.0), reject_quality_distances=(500.0, 500.0), association_distances=(500, 500), max_hit_multiplicities=[3], max_delta_chi=15, align_to_beam=True, use_limits=True, full_track_info=False, plot=True, chunk_size=50000):
+    telescope = Telescope(telescope_configuration)
+    n_duts = len(telescope)
+    logging.info('=== Running Combinatorial Kalman Filter of %d DUTs ===' % n_duts)
+
+    if output_tracks_file is None:
+        output_tracks_file = os.path.join(os.path.dirname(input_merged_file), 'Tracks_CKF.h5')
+    if plot:
+        output_pdf_file = os.path.splitext(output_tracks_file)[0] + '.pdf'
+        output_pdf = PdfPages(output_pdf_file, keep_empty=False)
+    else:
+        output_pdf = None
+
+    if select_duts is None:
+        select_duts = range(n_duts)  # standard setting: fit tracks for all DUTs
+    elif not isinstance(select_duts, Iterable):
+        select_duts = [select_duts]
+    # Check for duplicates
+    if len(select_duts) != len(set(select_duts)):
+        raise ValueError("found douplicate in select_duts")
+    # Check if any iterable in iterable
+    if any(map(lambda val: isinstance(val, Iterable), select_duts)):
+        raise ValueError("item in select_duts is iterable")
+
+    # Create track, hit selection
+    if select_fit_duts is None:  # If None: use all DUTs
+        select_fit_duts = range(n_duts)
+#         # copy each item
+#         for hit_duts in select_hit_duts:
+#             select_fit_duts.append(hit_duts[:])  # require a hit for each fit DUT
+    # Check iterable and length
+    if not isinstance(select_fit_duts, Iterable):
+        raise ValueError("select_fit_duts is no iterable")
+    elif not select_fit_duts:  # empty iterable
+        raise ValueError("select_fit_duts has no items")
+    # Check if only non-iterable in iterable
+    if all(map(lambda val: not isinstance(val, Iterable), select_fit_duts)):
+        select_fit_duts = [select_fit_duts[:] for _ in select_duts]
+    # Check if only iterable in iterable
+    if not all(map(lambda val: isinstance(val, Iterable), select_fit_duts)):
+        raise ValueError("not all items in select_fit_duts are iterable")
+    # Finally check length of all arrays
+    if len(select_fit_duts) != len(select_duts):  # empty iterable
+        raise ValueError("select_fit_duts has the wrong length")
+    for index, fit_dut in enumerate(select_fit_duts):
+        if len(fit_dut) < 2:  # check the length of the items
+            raise ValueError("item in select_fit_duts has length < 2")
+#         if set(fit_dut) - set(select_hit_duts[index]):  # fit DUTs are required to have a hit
+#             raise ValueError("DUT in select_fit_duts is not in select_hit_duts")
+
+    # Create track, hit selection
+    if select_hit_duts is None:  # If None, require no hit
+        #         select_hit_duts = range(n_duts)
+        select_hit_duts = []
+    # Check iterable and length
+    if not isinstance(select_hit_duts, Iterable):
+        raise ValueError("select_hit_duts is no iterable")
+#     elif not select_hit_duts:  # empty iterable
+#         raise ValueError("select_hit_duts has no items")
+    # Check if only non-iterable in iterable
+    if all(map(lambda val: not isinstance(val, Iterable), select_hit_duts)):
+        select_hit_duts = [select_hit_duts[:] for _ in select_duts]
+    # Check if only iterable in iterable
+    if not all(map(lambda val: isinstance(val, Iterable), select_hit_duts)):
+        raise ValueError("not all items in select_hit_duts are iterable")
+    # Finally check length of all arrays
+    if len(select_hit_duts) != len(select_duts):  # empty iterable
+        raise ValueError("select_hit_duts has the wrong length")
+#     for hit_dut in select_hit_duts:
+#         if len(hit_dut) < 2:  # check the length of the items
+#             raise ValueError("item in select_hit_duts has length < 2")
+
+    # Create quality distance
+    if isinstance(quality_distances, tuple) or quality_distances is None:
+        quality_distances = [quality_distances] * n_duts
+    # Check iterable and length
+    if not isinstance(quality_distances, Iterable):
+        raise ValueError("quality_distances is no iterable")
+    elif not quality_distances:  # empty iterable
+        raise ValueError("quality_distances has no items")
+    # Finally check length of all arrays
+    if len(quality_distances) != n_duts:  # empty iterable
+        raise ValueError("quality_distances has the wrong length")
+    # Check if only iterable in iterable
+    if not all(map(lambda val: isinstance(val, Iterable) or val is None, quality_distances)):
+        raise ValueError("not all items in quality_distances are iterable")
+    # Finally check length of all arrays
+    for distance in quality_distances:
+        if distance is not None and len(distance) != 2:  # check the length of the items
+            raise ValueError("item in quality_distances has length != 2")
+
+    # Create reject quality distance
+    if isinstance(reject_quality_distances, tuple) or reject_quality_distances is None:
+        reject_quality_distances = [reject_quality_distances] * n_duts
+    # Check iterable and length
+    if not isinstance(reject_quality_distances, Iterable):
+        raise ValueError("reject_quality_distances is no iterable")
+    elif not reject_quality_distances:  # empty iterable
+        raise ValueError("reject_quality_distances has no items")
+    # Finally check length of all arrays
+    if len(reject_quality_distances) != n_duts:  # empty iterable
+        raise ValueError("reject_quality_distances has the wrong length")
+    # Check if only iterable in iterable
+    if not all(map(lambda val: isinstance(val, Iterable) or val is None, reject_quality_distances)):
+        raise ValueError("not all items in reject_quality_distances are iterable")
+    # Finally check length of all arrays
+    for distance in reject_quality_distances:
+        if distance is not None and len(distance) != 2:  # check the length of the items
+            raise ValueError("item in reject_quality_distances has length != 2")
+
+    # Create association distances
+    if isinstance(association_distances, tuple) or association_distances is None:
+        association_distances = [association_distances] * n_duts
+    # Check iterable and length
+    if not isinstance(association_distances, Iterable):
+        raise ValueError("association_distances is no iterable")
+    elif not association_distances:  # empty iterable
+        raise ValueError("association_distances has no items")
+    # Finally check length of all arrays
+    if len(association_distances) != n_duts:  # empty iterable
+        raise ValueError("association_distances has the wrong length")
+    # Check if only iterable in iterable
+    if not all(map(lambda val: isinstance(val, Iterable) or val is None, association_distances)):
+        raise ValueError("not all items in association_distances are iterable")
+    # Finally check length of all arrays
+    for distance in association_distances:
+        if distance is not None and len(distance) != 2:  # check the length of the items
+            raise ValueError("item in association_distances has length != 2")
+
+    # Create max_hit_multiplicities
+    if not isinstance(max_hit_multiplicities, Iterable):
+        max_hit_multiplicities = [max_hit_multiplicities] * n_duts
+    # Check iterable and length
+    if not isinstance(max_hit_multiplicities, Iterable):
+        raise ValueError("max_hit_multiplicities is no iterable")
+    elif not max_hit_multiplicities:  # empty iterable
+        raise ValueError("max_hit_multiplicities has no items")
+    # Finally check length of all arrays
+    if len(max_hit_multiplicities) != n_duts:  # empty iterable
+        raise ValueError("max_hit_multiplicities has the wrong length")
+
+    # Check iterable and length
+    if not isinstance(exclude_dut_hit, Iterable):
+        exclude_dut_hit = [exclude_dut_hit] * len(select_duts)
+    elif not exclude_dut_hit:  # empty iterable
+        raise ValueError("exclude_dut_hit has no items")
+    # Finally check length of all array
+    if len(exclude_dut_hit) != len(select_duts):  # empty iterable
+        raise ValueError("exclude_dut_hit has the wrong length")
+    # Check if only bools in iterable
+    if not all(map(lambda val: isinstance(val, (bool,)), exclude_dut_hit)):
+        raise ValueError("not all items in exclude_dut_hit are boolean")
+
+    pool = Pool()  # For multiprocessing
+    fitted_duts = []
+    # Load hits from merged file
+    with tb.open_file(input_merged_file, mode='r') as in_file_h5:
+        tracklets_node = in_file_h5.root.MergedClusters
+
+        with tb.open_file(output_tracks_file, mode='w') as out_file_h5:
+            for fit_dut_index, actual_fit_dut in enumerate(select_duts):  # Loop over the DUTs where tracks shall be fitted for
+                if actual_fit_dut in fitted_duts:
+                    continue
+                # Test whether other DUTs have identical tracks
+                # if yes, save some CPU time and fit only once.
+                # This following list contains all DUT indices that will be fitted
+                # during this step of the loop.
+                actual_fit_duts = []
+                for curr_fit_dut_index, curr_fit_dut in enumerate(select_duts):
+                    if ((curr_fit_dut == actual_fit_dut) or (exclude_dut_hit[curr_fit_dut_index] is False and exclude_dut_hit[fit_dut_index] is False) and set(select_hit_duts[curr_fit_dut_index]) == set(select_hit_duts[fit_dut_index]) and set(select_fit_duts[curr_fit_dut_index]) == set(select_fit_duts[fit_dut_index])):
+                        actual_fit_duts.append(curr_fit_dut)
+                logging.info('= Running Combinatorial Kalman Filter for %s =', ', '.join([telescope[curr_dut].name for curr_dut in actual_fit_duts]))
+                # remove existing nodes
+                for dut_index in actual_fit_duts:
+                    try:  # Check if table already exists, then append data
+                        out_file_h5.remove_node(out_file_h5.root, name='Tracks_DUT%d' % dut_index)
+                        logging.info('Overwriting existing tracks for DUT%d', dut_index)
+                    except tb.NodeError:  # Table does not exist, thus create new
+                        pass
+                total_n_tracks = tracklets_node.shape[0]
+                total_n_tracks_stored = 0
+                total_n_events_stored = 0
+
+                # select hit DUTs based on input parameters
+                hit_duts = list(set(select_hit_duts[fit_dut_index]) - set(actual_fit_duts)) if exclude_dut_hit[fit_dut_index] else select_hit_duts[fit_dut_index]
+                actual_min_track_hits = min_track_hits[fit_dut_index]
+                can_have_hits = list(set(range(len(telescope))) - set(select_hit_duts[fit_dut_index]))  # DUTs which can have a hit (exclude DUTs which require a hit)
+
+#                 if actual_min_track_hits is None:
+#                     dut_hit_selection = 0  # DUTs required to have hits
+#                     for dut_index in hit_duts:
+#                         dut_hit_selection |= ((1 << dut_index))
+#                 dut_hit_selection = [dut_hit_selection]
+#                 else:
+#                     dut_hit_selection = []
+#                     all_dut_hit_selection = 0
+#                     can_have_hits = list(set(range(len(telescope))) - set(select_hit_duts[fit_dut_index]))  # DUTs which can have a hit (exclude DUTs which require a hit)
+#                     dut_hit_combinations = combinations(can_have_hits, actual_min_track_hits)  # Get all possible combinations of DUTs which can have a hit
+# 
+#                     all_hit_duts = can_have_hits + hit_duts  # Duts which are allowed to have a hit
+#                     for index in all_hit_duts:
+#                         all_dut_hit_selection |= (1 << index)
+# 
+#                     # Create dut hit selection
+#                     for dut_hit_combination in list(dut_hit_combinations):  # Loop over all combinations
+#                         hit_selection = all_dut_hit_selection  # Reset hit selection for every combination
+#                         no_hit_duts = set(can_have_hits) - set(dut_hit_combination)
+#                         for index in no_hit_duts:
+#                             hit_selection -= (1 << index)  # Substract each DUT
+#                         dut_hit_selection.append(hit_selection)
+#                 if actual_min_track_hits is None:
+                logging.info('Require hits in %d DUTs for track selection: %s', len(hit_duts), ', '.join([telescope[curr_dut].name for curr_dut in hit_duts]))
+#                 else:
+#                     logging.info('Require at least %d hits in the following DUTs for track selection: %s', actual_min_track_hits, ', '.join([telescope[curr_dut].name for curr_dut in can_have_hits]))
+#                     logging.info('Require hits in %d DUTs for track selection: %s', len(hit_duts), ', '.join([telescope[curr_dut].name for curr_dut in hit_duts]))
+                # select fit DUTs based on input parameters
+                dut_fit_selection = 0  # DUTs to be used for the fit
+                fit_duts = list(set(select_fit_duts[fit_dut_index]) - set(actual_fit_duts)) if exclude_dut_hit[fit_dut_index] else select_fit_duts[fit_dut_index]
+                for dut_index in fit_duts:
+                    dut_fit_selection |= ((1 << dut_index))
+                logging.info("Use %d DUTs for track fit: %s", len(fit_duts), ', '.join([telescope[curr_dut].name for curr_dut in fit_duts]))
+                widgets = ['', progressbar.Percentage(), ' ',
+                           progressbar.Bar(marker='*', left='|', right='|'),
+                           ' ', progressbar.AdaptiveETA()]
+                progress_bar = progressbar.ProgressBar(widgets=widgets,
+                                                       maxval=total_n_tracks,
+                                                       term_width=80)
+                # progress_bar = progressbar.ProgressBar(widgets=['', progressbar.Percentage(), ' ', progressbar.Bar(marker='*', left='|', right='|'), ' ', progressbar.AdaptiveETA()], maxval=max_tracks if max_tracks is not None else in_file_h5.root.TrackCandidates.shape[0], term_width=80)
+                progress_bar.start()
+
+                chunk_indices = []
+                chunk_stats = []
+                dut_stats = []
+                # Loop over tracklets
+                for tracklets_data_chunk, index_chunk in analysis_utils.data_aligned_at_events(tracklets_node, start_event_number=0, stop_event_number=2500000, chunk_size=chunk_size):
+                    chunk_indices.append(index_chunk)
+                    chunk_stats.append(1.0)  # TODO: fix this
+                    n_tracks_chunk = tracklets_data_chunk.shape[0]
+
+                    unique_events = np.unique(tracklets_data_chunk["event_number"])
+                    n_events_chunk = unique_events.shape[0]
+
+                    if max_events:
+                        if total_n_tracks == index_chunk:  # last chunk, adding all remaining events
+                            select_n_events = max_events - total_n_events_stored
+                        elif total_n_events_stored == 0:  # first chunk
+                            select_n_events = int(round(max_events * (n_tracks_chunk / total_n_tracks)))
+                        else:
+                            # calculate correction of number of selected events
+                            correction = (total_n_tracks - index_chunk)/total_n_tracks * 1 / (((total_n_tracks-last_index_chunk)/total_n_tracks)/((max_events-total_n_events_stored_last)/max_events)) \
+                                         + (index_chunk)/total_n_tracks * 1 / (((last_index_chunk)/total_n_tracks)/((total_n_events_stored_last)/max_events))
+                            select_n_events = int(round(max_events * (n_tracks_chunk / total_n_tracks) * correction))
+                        # do not store more events than in current chunk
+                        select_n_events = min(n_events_chunk, select_n_events)
+                        # do not store more events than given by max_events
+                        select_n_events = min(select_n_events, max_events - total_n_events_stored)
+                        np.random.seed(seed=0)
+                        selected_events = np.random.choice(unique_events, size=select_n_events, replace=False)
+                        store_n_events = selected_events.shape[0]
+                        total_n_events_stored += store_n_events
+                        selected_tracks = np.in1d(tracklets_data_chunk["event_number"], selected_events)
+                        store_n_tracks = np.count_nonzero(selected_tracks)
+                        # TODO: total_n_tracks_stored not used...
+                        total_n_tracks_stored += store_n_tracks
+                        tracklets_data_chunk = tracklets_data_chunk[selected_tracks]
+
+                    # Prepare hit data for track finding, create temporary arrays for x, y, z position and charge data
+                    # This is needed to call a numba jitted function, since the number of DUTs is not fixed and thus the data format
+                    track_hits = np.full((tracklets_data_chunk.shape[0], n_duts, 6), fill_value=np.nan, dtype=np.float)
+                    for dut_index, dut in enumerate(telescope):  # Fill index loop of new array
+                        # TODO: taking telescope alignment into account for initial state
+                        # apply alignment for fitting the tracks
+                        track_hits[:, dut_index, 0], track_hits[:, dut_index, 1], track_hits[:, dut_index, 2] = dut.local_to_global_position(
+                            x=tracklets_data_chunk['x_dut_%s' % dut_index],
+                            y=tracklets_data_chunk['y_dut_%s' % dut_index],
+                            z=tracklets_data_chunk['z_dut_%s' % dut_index])
+                        track_hits[:, dut_index, 3], track_hits[:, dut_index, 4], track_hits[:, dut_index, 5] = np.abs(dut.local_to_global_position(
+                            x=tracklets_data_chunk['x_err_dut_%s' % dut_index],
+                            y=tracklets_data_chunk['y_err_dut_%s' % dut_index],
+                            z=tracklets_data_chunk['z_err_dut_%s' % dut_index],
+                            # no translation for the errors
+                            translation_x=0.0,
+                            translation_y=0.0,
+                            translation_z=0.0))
+#                         if align_to_beam:
+#                             track_hits[:, dut_index, 0], track_hits[:, dut_index, 1], track_hits[:, dut_index, 2] = dut.local_to_global_position(
+#                                 x=track_hits[:, dut_index, 0],
+#                                 y=track_hits[:, dut_index, 1],
+#                                 z=track_hits[:, dut_index, 2],
+#                                 translation_x=telescope.translation_x,
+#                                 translation_y=telescope.translation_y,
+#                                 translation_z=telescope.translation_z,
+#                                 rotation_alpha=telescope.rotation_alpha,
+#                                 rotation_beta=telescope.rotation_beta,
+#                                 rotation_gamma=telescope.rotation_gamma)
+# 
+#                             track_hits[:, dut_index, 3], track_hits[:, dut_index, 4], track_hits[:, dut_index, 5] = np.abs(dut.local_to_global_position(
+#                                 x=track_hits[:, dut_index, 3],
+#                                 y=track_hits[:, dut_index, 4],
+#                                 z=track_hits[:, dut_index, 5],
+#                                 translation_x=0.0,
+#                                 translation_y=0.0,
+#                                 translation_z=0.0,
+#                                 rotation_alpha=telescope.rotation_alpha,
+#                                 rotation_beta=telescope.rotation_beta,
+#                                 rotation_gamma=telescope.rotation_gamma))
+
+                    per_event_track_variables = np.zeros(shape=(4, tracklets_data_chunk.shape[0]))
+                    per_dut_track_variables = np.zeros(shape=(6, tracklets_data_chunk.shape[0], n_duts))
+                    # Fill track variables (all others need to be still calculated)
+                    per_event_track_variables[0] = tracklets_data_chunk['event_number']
+                    for dut_index in range(n_duts):
+                        per_dut_track_variables[0, :, dut_index] = tracklets_data_chunk['charge_dut_%d' % dut_index]
+                        per_dut_track_variables[1, :, dut_index] = tracklets_data_chunk['n_hits_dut_%d' % dut_index]
+                        per_dut_track_variables[2, :, dut_index] = tracklets_data_chunk['cluster_shape_dut_%d' % dut_index]
+                        per_dut_track_variables[3, :, dut_index] = tracklets_data_chunk['n_cluster_dut_%d' % dut_index]
+                        per_dut_track_variables[4, :, dut_index] = tracklets_data_chunk['frame_dut_%d' % dut_index]
+                        per_dut_track_variables[5, :, dut_index] = tracklets_data_chunk['cluster_ID_dut_%d' % dut_index]
+
+                    # Split data and fit on all available cores.
+                    n_slices = cpu_count()
+                    logging.info('Doing combinatorial kalman filter on %i cores', n_slices)
+                    # Take care that no event is splitted
+                    _, unique_indices = np.unique(tracklets_data_chunk['event_number'], return_index=True)
+                    split_indices = np.array_split(unique_indices, n_slices)
+                    # track_hits_slices = np.array_split(track_hits, n_slices)
+                    track_hits_slices = np.array_split(track_hits, [split_index[0] for split_index in split_indices[1:]])
+                    per_event_track_variables_slices = np.array_split(per_event_track_variables, [split_index[0] for split_index in split_indices[1:]], axis=1)
+                    per_dut_track_variables_slices = np.array_split(per_dut_track_variables, [split_index[0] for split_index in split_indices[1:]], axis=1)
+   
+                    results = [pool.apply_async(_combinatorial_kalman_filter, kwds={
+                        'track_hits': track_hits_slice,
+                        'per_event_track_variables': per_event_track_variables_slice,
+                        'per_dut_track_variables': per_dut_track_variables_slice,
+                        'telescope': telescope,
+                        'select_fit_duts': fit_duts,
+                        'select_hit_duts': hit_duts,
+                        'can_have_hits': can_have_hits,
+                        'max_missing_hits': len(can_have_hits) - actual_min_track_hits,
+                        'max_hit_multiplicities': max_hit_multiplicities,
+                        'association_distances': association_distances,
+                        'quality_distances': quality_distances,
+                        'beam_energy': beam_energy,
+                        'particle_mass': particle_mass,
+                        'max_delta_chi': max_delta_chi}) for (track_hits_slice, per_event_track_variables_slice, per_dut_track_variables_slice) in zip(track_hits_slices, per_event_track_variables_slices, per_dut_track_variables_slices)]
+
+#                     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 unused import
+#                     fig = plt.figure()
+#                     ax = fig.add_subplot(111, projection='3d')
+#                     for i in range(track_hits.shape[0]):
+#                         for dut_index in range(8):
+#                             ax.scatter(track_hits[i, dut_index, 0], track_hits[i, dut_index, 1], track_hits[i, dut_index, 2], marker='<', label=('actual track hits %i' % dut_index) if i==0 else '')
+#                     ax.set_xlabel('X Label')
+#                     ax.set_ylabel('Y Label')
+#                     ax.set_zlabel('Z Label')
+#                     ax.set_title('CKF')
+#                     plt.legend()
+#                     plt.show()
+#                     # Do combinatorial Kalman Filter. Returns final track hits and the smoothed states (Unique hit assignment ensured, tracks always selected based on lowest chi2, from smoothed result).
+#                     (final_track_hits, track_estimates_chunk, final_per_event_track_variables, final_per_dut_track_variables) = _combinatorial_kalman_filter(
+#                         # Possible track hits and corresponding event number
+#                         track_hits=track_hits,
+#                         per_event_track_variables=per_event_track_variables,
+#                         per_dut_track_variables=per_dut_track_variables,
+#                         telescope=telescope,
+#                         # Settings
+#                         select_fit_duts=fit_duts,
+#                         select_hit_duts=hit_duts,
+#                         can_have_hits=can_have_hits,
+#                         max_missing_hits=len(can_have_hits) - actual_min_track_hits,
+#                         max_hit_multiplicities=max_hit_multiplicities,
+#                         association_distances=association_distances,
+#                         quality_distances=quality_distances,
+#                         beam_energy=beam_energy,
+#                         particle_mass=particle_mass,
+#                         max_delta_chi=max_delta_chi)
+
+                    # Unpack result from multiprocessing
+                    final_track_hits = np.concatenate([result.get()[0] for result in results])  # Merge offsets from all cores in results
+                    track_estimates_chunk = np.concatenate([result.get()[1] for result in results])  # Merge slopes from all cores in results
+                    final_per_event_track_variables = np.concatenate([result.get()[2] for result in results], axis=1)  # Merge event variables from all cores in results
+                    final_per_dut_track_variables = np.concatenate([result.get()[3] for result in results], axis=1)  # Merge dut variables from all cores in results
+
+                    # Put track candidates into same array structure as TrackCandidates. Therefore can use existing storing function.
+                    track_candidates_array = np.empty((final_track_hits.shape[0],), dtype=tracklets_data_chunk.dtype.descr)
+                    track_candidates_array['hit_flag'] = final_per_event_track_variables[2]
+                    track_candidates_array['event_number'] = final_per_event_track_variables[0]
+                    for dut_index, dut in enumerate(telescope):
+                        # Transform hits into local coordinate system and write to result array
+                        final_track_hits[:, dut_index, 0], final_track_hits[:, dut_index, 1], final_track_hits[:, dut_index, 2] = dut.global_to_local_position(
+                            x=final_track_hits[:, dut_index, 0],
+                            y=final_track_hits[:, dut_index, 1],
+                            z=final_track_hits[:, dut_index, 2])
+                        final_track_hits[:, dut_index, 3], final_track_hits[:, dut_index, 4], final_track_hits[:, dut_index, 5] = np.abs(dut.global_to_local_position(
+                            x=final_track_hits[:, dut_index, 3],
+                            y=final_track_hits[:, dut_index, 4],
+                            z=final_track_hits[:, dut_index, 5],
+                            # no translation for the errors
+                            translation_x=0.0,
+                            translation_y=0.0,
+                            translation_z=0.0))
+#                         if align_to_beam:
+#                             final_track_hits[:, dut_index, 0], final_track_hits[:, dut_index, 1], final_track_hits[:, dut_index, 2] = dut.global_to_local_position(
+#                                 x=final_track_hits[:, dut_index, 0],
+#                                 y=final_track_hits[:, dut_index, 1],
+#                                 z=final_track_hits[:, dut_index, 2],
+#                                 translation_x=telescope.translation_x,
+#                                 translation_y=telescope.translation_y,
+#                                 translation_z=telescope.translation_z,
+#                                 rotation_alpha=telescope.rotation_alpha,
+#                                 rotation_beta=telescope.rotation_beta,
+#                                 rotation_gamma=telescope.rotation_gamma)
+#                             final_track_hits[:, dut_index, 3], final_track_hits[:, dut_index, 4], final_track_hits[:, dut_index, 5] = np.abs(dut.global_to_local_position(
+#                                 x=final_track_hits[:, dut_index, 3],
+#                                 y=final_track_hits[:, dut_index, 4],
+#                                 z=final_track_hits[:, dut_index, 5],
+#                                 translation_x=0.0,
+#                                 translation_y=0.0,
+#                                 translation_z=0.0,
+#                                 rotation_alpha=telescope.rotation_alpha,
+#                                 rotation_beta=telescope.rotation_beta,
+#                                 rotation_gamma=telescope.rotation_gamma))
+
+                        track_candidates_array['x_dut_%d' % dut_index] = final_track_hits[:, dut_index, 0]
+                        track_candidates_array['y_dut_%d' % dut_index] = final_track_hits[:, dut_index, 1]
+                        track_candidates_array['z_dut_%d' % dut_index] = final_track_hits[:, dut_index, 2]
+                        track_candidates_array['x_err_dut_%d' % dut_index] = final_track_hits[:, dut_index, 3]
+                        track_candidates_array['y_err_dut_%d' % dut_index] = final_track_hits[:, dut_index, 4]
+                        track_candidates_array['z_err_dut_%d' % dut_index] = final_track_hits[:, dut_index, 5]
+                        track_candidates_array['charge_dut_%d' % dut_index] = final_per_dut_track_variables[0, :, dut_index]
+                        track_candidates_array['n_hits_dut_%d' % dut_index] = final_per_dut_track_variables[1, :, dut_index]
+                        track_candidates_array['cluster_shape_dut_%d' % dut_index] = final_per_dut_track_variables[2, :, dut_index]
+                        track_candidates_array['n_cluster_dut_%d' % dut_index] = final_per_dut_track_variables[3, :, dut_index]
+                        track_candidates_array['frame_dut_%d' % dut_index] = final_per_dut_track_variables[4, :, dut_index]
+                        track_candidates_array['cluster_ID_dut_%d' % dut_index] = final_per_dut_track_variables[5, :, dut_index]
+
+                    dut_stats.append(store_track_data(
+                        out_file_h5=out_file_h5,
+                        track_candidates_chunk=track_candidates_array,
+                        good_track_selection=np.full(shape=(track_candidates_array.shape[0]), fill_value=True, dtype=np.bool),
+                        telescope=telescope,
+                        offsets=track_estimates_chunk[:, :, :3],
+                        slopes=track_estimates_chunk[:, :, 3:],
+                        track_chi2s=final_per_event_track_variables[1],  # chi2
+                        fit_duts=actual_fit_duts,  # storing tracks for these DUTs
+                        select_fit_duts=fit_duts,  # DUTs used for fitting tracks
+                        select_align_duts=None,  # Does not exist in CKF
+                        quality_distances=quality_distances,
+                        reject_quality_distances=reject_quality_distances,
+                        use_limits=use_limits,
+                        keep_data=False,  # Does not exist in CKF
+                        method='ckf',
+                        full_track_info=full_track_info))
+
+                    # total_n_tracks += n_good_tracks
+                    total_n_events_stored_last = total_n_events_stored
+                    total_n_tracks_last = total_n_tracks
+                    last_index_chunk = index_chunk
+                    progress_bar.update(index_chunk)
+                    # progress_bar.update(min(total_n_tracks, max_tracks) if max_tracks is not None else index_chunk)
+                progress_bar.finish()
+                # print "***************"
+                # print "total_n_tracks_stored", total_n_tracks_stored
+                # print "total_n_events_stored", total_n_events_stored
+                fitted_duts.extend(actual_fit_duts)
+
+                plot_utils.plot_fit_tracks_statistics(
+                    telescope=telescope,
+                    fit_duts=actual_fit_duts,
+                    chunk_indices=chunk_indices,
+                    chunk_stats=chunk_stats,
+                    dut_stats=dut_stats,
+                    output_pdf=output_pdf)
+
+    pool.close()
+    pool.join()
+
+    if output_pdf is not None:
+        output_pdf.close()
+
+    if plot:
+        plot_utils.plot_track_chi2(input_tracks_file=output_tracks_file, output_pdf_file=None, dut_names=telescope.dut_names, chunk_size=chunk_size)
+
+    return output_tracks_file
+
+
+def _combinatorial_kalman_filter(track_hits, per_event_track_variables, per_dut_track_variables, telescope, select_fit_duts, select_hit_duts, can_have_hits, max_missing_hits, max_hit_multiplicities, association_distances, quality_distances, beam_energy, particle_mass, max_delta_chi):
+    n_duts = track_hits.shape[1]
+    n_dim_state = track_hits.shape[2]
+    n_dim_obs = 3  # x,y,z as observations (as in KF)
+#     # Needed arrays in order to store result of the Kalman Filter (after processing all planes) in order to use them for the Kalman Smoother
+#     predicted_states_combined = np.empty((0, n_duts, n_dim_state))
+#     predicted_state_covariances_combined = np.empty((0, n_duts, n_dim_state, n_dim_state))
+#     filtered_states_combined = np.empty((0, n_duts, n_dim_state))
+#     filtered_state_covariances_combined = np.empty((0, n_duts, n_dim_state, n_dim_state))
+
+#     # Array for storing hits (x, y, z, xerr, yerr, zerr) of possible tracks
+#     track_hits_buffer_combined = np.zeros((0, n_duts, n_dim_state))
+
+    track_hits_buffer = 0  # Hits belonging to possbile tracks. Only needed to define variable
+    per_event_track_variables_buffer = 0  # Variables like event number, chi2, hit flag
+    per_dut_track_variables_buffer = 0  # Variables like charge, number of hits, cluster shape
+
+    n_trees = track_hits.shape[0]  # Number of trees for actual plane
+    seed_slope = [0.0, 0.0, 1.0]  # TODO: maybe better guess. Wrong slope could be 'corrected' with larger search radius for in second plane with the disadvantage of having higher multiplicity
+
+    # Arrays needed for Kalman Filter. Results (calculated plane by plane) will be written to these arrays and used for the next plane.
+    predicted_states = np.zeros((track_hits.shape[0], n_duts, n_dim_state))
+    predicted_state_covariances = np.zeros((track_hits.shape[0], n_duts, n_dim_state, n_dim_state))
+    kalman_gains = np.zeros((track_hits.shape[0], n_duts, n_dim_state, n_dim_obs))
+    filtered_states = np.zeros_like(predicted_states)
+    filtered_state_covariances = np.zeros_like(predicted_state_covariances)
+    transition_matrices = np.zeros((track_hits.shape[0], n_duts - 1, n_dim_state, n_dim_state))
+    chi2_filter = np.zeros((track_hits.shape[0], n_duts))
+
+    kalman_filter_iteration = 0  # Counting number of Kalman Filter iterations
+
+    for dut_index, dut in enumerate(telescope):
+        # Create array for storing possible track hits.
+        # Amount of possible tracks is limited by max_multiplicity and number of tree at this plane.
+        if dut_index == 0:  # First plane
+            # Put seed hits into possible track hits
+            track_hits_buffer = track_hits[:, 0, :]
+            per_event_track_variables_buffer = np.zeros(shape=(per_event_track_variables.shape[0], track_hits.shape[0]))
+            for i in range(per_event_track_variables_buffer.shape[0]):
+                per_event_track_variables_buffer[i] = per_event_track_variables[i]
+            per_dut_track_variables_buffer = np.zeros(shape=(per_dut_track_variables.shape[0], track_hits.shape[0], track_hits.shape[1]))
+            for i in range(per_dut_track_variables_buffer.shape[0]):
+                per_dut_track_variables_buffer[i] = per_dut_track_variables[i]
+            per_event_track_variables_buffer[2, ~np.isnan(track_hits_buffer[:, 0])] += (1 << dut_index)  # Set hit flag for first plane
+            continue  # Continue with next DUT
+        else:  # From second plane on
+            # Copy results and reset buffer
+            possible_track_hits_old = np.copy(track_hits_buffer)
+            old_per_event_track_variables = np.copy(per_event_track_variables_buffer)
+            old_per_dut_track_variables = np.copy(per_dut_track_variables_buffer)
+            track_hits_buffer = np.full(shape=(max_hit_multiplicities[dut_index] * n_trees, dut_index + 1, n_dim_state), fill_value=np.inf)
+            per_event_track_variables_buffer = np.full(shape=(old_per_event_track_variables.shape[0], max_hit_multiplicities[dut_index] * n_trees), fill_value=np.inf)
+            per_dut_track_variables_buffer = np.full(shape=(old_per_dut_track_variables.shape[0], max_hit_multiplicities[dut_index] * n_trees, dut_index + 1), fill_value=np.inf)
+            n_trees = 0  # Reset number of trees after initializing all needed arrays.
+
+            if dut_index == 1:   # Second plane
+                # No filter result available for second plane. Thus use seed slope and extrapolate hits from plane before to actual plane.
+                line_origins = possible_track_hits_old[:, 0:3]
+                line_directions = np.tile(np.array([seed_slope]), (possible_track_hits_old.shape[0], 1))
+                fill_kf_results = False  # No Kalman Filter result yet available
+                select_duts = [0, 1]
+            else:  # From third plane on
+                # Use filter result from plane before in order to extrapolate to actual plane.
+                line_origins = filtered_states[:, dut_index - 1, :3]
+                line_directions = filtered_states[:, dut_index - 1, 3:]
+                fill_kf_results = True
+                select_duts = [dut_index]
+            # Extrapolate hits from plane before to actual plane
+            # TODO: check what happens if nan will be extrapolated
+            extrapolations = geometry_utils.get_line_intersections_with_dut(
+                line_origins=line_origins,
+                line_directions=line_directions,
+                translation_x=dut.translation_x,
+                translation_y=dut.translation_y,
+                translation_z=dut.translation_z,
+                rotation_alpha=dut.rotation_alpha,
+                rotation_beta=dut.rotation_beta,
+                rotation_gamma=dut.rotation_gamma)
+# 
+#             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 unused import
+#             fig = plt.figure()
+#             ax = fig.add_subplot(111, projection='3d')
+#             for i in range(possible_track_hits_old.shape[0]):
+#                 try:
+#                     ax.scatter(possible_track_hits_old[i, :, 0], possible_track_hits_old[i, :, 1], possible_track_hits_old[i, :, 2], marker='o', label='possible_track_hits_old hits' if i==0 else '')
+#                 except:
+#                     ax.scatter(possible_track_hits_old[i, 0], possible_track_hits_old[i, 1], possible_track_hits_old[i, 2], marker='o', label='track hits' if i==0 else '')
+#             for i in range(track_hits.shape[0]):
+#                 ax.scatter(track_hits[i, dut_index, 0], track_hits[i, dut_index, 1], track_hits[i, dut_index, 2], marker='<', label=('actual track hits %i' % dut_index) if i==0 else '')
+#             for i in range(filtered_states.shape[0]):
+#                 try:
+#                     ax.scatter(filtered_states[i, dut_index - 1, 0], filtered_states[i, dut_index - 1, 1], filtered_states[i, dut_index - 1, 2], marker='P', label=('filtered_states %i' % dut_index) if i==0 else '')
+#                 except:
+#                     pass
+#             for i in range(extrapolations[:, 0].shape[0]):
+#                 ax.plot([extrapolations[i, 0], line_origins[i, 0]], [extrapolations[i, 1], line_origins[i, 1]], [extrapolations[i, 2], line_origins[i, 2]], ls='--', marker='s', label=('extraploations %i' % dut_index)  if i==0 else '')
+#             ax.set_xlabel('X Label')
+#             ax.set_ylabel('Y Label')
+#             ax.set_zlabel('Z Label')
+#             ax.set_title('CKF')
+#             plt.legend()
+#             plt.show()
+
+            # Search for hits within search radius
+            (n_trees, track_hits_buffer, per_event_track_variables_buffer, per_dut_track_variables_buffer,
+             predicted_states, predicted_state_covariances, kalman_gains, filtered_states,
+             filtered_state_covariances, transition_matrices, chi2_filter) = _search_hits_within_search_radius(
+                actual_dut_hits=track_hits[:, dut_index, :],
+                actual_per_event_track_variables=per_event_track_variables,
+                actual_per_dut_track_variables=per_dut_track_variables,
+                possible_track_hits_old=possible_track_hits_old,
+                old_per_event_track_variables=old_per_event_track_variables,
+                old_per_dut_track_variables=old_per_dut_track_variables,
+                track_hits_buffer=track_hits_buffer,
+                per_event_track_variables_buffer=per_event_track_variables_buffer,
+                per_dut_track_variables_buffer=per_dut_track_variables_buffer,
+                n_trees=n_trees, dut_index=dut_index, association_distance=association_distances[dut_index], max_hit_multiplicity=max_hit_multiplicities[dut_index],
+                select_hit_duts=select_hit_duts if not len(select_hit_duts) == 0 else [-1], extrapolations=extrapolations,
+                predicted_states=predicted_states, predicted_state_covariances=predicted_state_covariances, kalman_gains=kalman_gains,
+                filtered_states=filtered_states, filtered_state_covariances=filtered_state_covariances, transition_matrices=transition_matrices,
+                chi2=chi2_filter, fill_kf_results=fill_kf_results)
+
+            # Number of possible tracks usually smaller than allowed maximum. Thus, cut not needed possible tracks.
+            track_hits_buffer = track_hits_buffer[:n_trees]
+            per_event_track_variables_buffer = per_event_track_variables_buffer[:, :n_trees]
+            per_dut_track_variables_buffer = per_dut_track_variables_buffer[:, :n_trees, :]
+            predicted_states = predicted_states[:n_trees]
+            predicted_state_covariances = predicted_state_covariances[:n_trees]
+            kalman_gains = kalman_gains[:n_trees]
+            filtered_states = filtered_states[:n_trees]
+            filtered_state_covariances = filtered_state_covariances[:n_trees]
+            transition_matrices = transition_matrices[:n_trees]
+            chi2_filter = chi2_filter[:n_trees]
+            (predicted_states, predicted_state_covariances, kalman_gains, filtered_states,
+             filtered_state_covariances, transition_matrices, chi2_filter) = run_kalman_filter(
+                 select_duts=select_duts,
+                 use_kalman_filter_result=False if kalman_filter_iteration == 0 else True,  # For first iteration no Kalman Filter available yet. Use it for further iterations
+                 track_hits=track_hits_buffer,
+                 telescope=telescope,
+                 select_fit_duts=select_fit_duts,
+                 beam_energy=beam_energy,
+                 particle_mass=particle_mass,
+                 predicted_states=predicted_states,
+                 predicted_state_covariances=predicted_state_covariances,
+                 kalman_gains=kalman_gains,
+                 filtered_states=filtered_states,
+                 filtered_state_covariances=filtered_state_covariances,
+                 transition_matrices=transition_matrices,
+                 chi2_filter=chi2_filter)
+            kalman_filter_iteration += 1  # Increase iteration by one.
+
+            # Calculate for each track a score
+            chi2_weight = 0.1  # TODO: adjust this? Put this as parameter
+            missing_hits = np.count_nonzero(np.isnan(track_hits_buffer[:, np.array([can_have_hits])[np.array([can_have_hits]) < track_hits_buffer.shape[1]], 0]), axis=1)
+            track_score = 2 * track_hits_buffer.shape[1] - missing_hits - chi2_weight * np.nansum(chi2_filter, axis=1)
+#             plt.hist(track_score, bins=np.arange(0, 20, 0.5))
+#             plt.show()
+
+            actual_chi2 = chi2_filter[:, dut_index]
+            sel = ~np.isnan(actual_chi2)
+            actual_chi2 = actual_chi2[sel]
+            max_delta_chi = [50, 50, 50, 50, 50, 50, 50, 10]
+            # print np.percentile(actual_chi2, q=68.27), np.percentile(actual_chi2, q=90.0), np.percentile(actual_chi2, q=95.45), np.percentile(actual_chi2, q=99.73), dut_index
+#             plt.hist(actual_chi2, bins=np.arange(0, 150, 0.5), label='Filter plane %i' % dut_index)
+#             plt.legend()
+#             plt.show()
+
+            _, seed_id_indices = np.unique(per_event_track_variables_buffer[3], return_index=True)
+            # Do quality selection in order to reduce possible combinatorics. Actual DUT is excluded in order to not bias it.
+            no_quality_duts = set(range(len(telescope))) - set(can_have_hits) - set(select_hit_duts)
+            if dut_index not in no_quality_duts:
+                good_track_selection = _check_for_good_hits(
+                    hits=track_hits_buffer[:, :, 0:3],
+                    actual_track_chi2=chi2_filter[:, dut_index],
+                    track_score=track_score,
+                    missing_hits=missing_hits,
+                    actual_dut=dut_index,
+                    # Take 1 sigma as max chi2. Dynamic limit is useful here since chi2 from Kalman Filter will get better with each plane.
+                    max_delta_chi2=max_delta_chi[dut_index], #np.percentile(actual_chi2, q=qs[dut_index]),  # max_delta_chi2
+                    max_delta_score=3,  # TODO: check this
+                    seed_ids=per_event_track_variables_buffer[3],
+                    indices=seed_id_indices,
+                    max_missing_hits=max_missing_hits)
+                # Apply quality selection
+                track_hits_buffer = track_hits_buffer[good_track_selection]
+                per_event_track_variables_buffer = per_event_track_variables_buffer[:, good_track_selection]
+                per_dut_track_variables_buffer = per_dut_track_variables_buffer[:, good_track_selection, :]
+                predicted_states = predicted_states[good_track_selection]
+                predicted_state_covariances = predicted_state_covariances[good_track_selection]
+                kalman_gains = kalman_gains[good_track_selection]
+                filtered_states = filtered_states[good_track_selection]
+                filtered_state_covariances = filtered_state_covariances[good_track_selection]
+                transition_matrices = transition_matrices[good_track_selection]
+                chi2_filter = chi2_filter[good_track_selection]
+                track_score = track_score[good_track_selection]
+
+#             # Plotting for debugging
+#             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 unused import
+#             fig = plt.figure()
+#             ax = fig.add_subplot(111, projection='3d')
+#             for i in range(track_hits_buffer.shape[0]):
+#                 try:
+#                     ax.scatter(track_hits_buffer[i, :, 0], track_hits_buffer[i, :, 1], track_hits_buffer[i, :, 2], marker='o', label='track hits' if i==0 else '')
+#                 except:
+#                     ax.scatter(track_hits_buffer[i, 0], track_hits_buffer[i, 1], track_hits_buffer[i, 2], marker='o', label='track hits' if i==0 else '')
+#             for i in range(track_hits.shape[0]):
+#                 ax.scatter(track_hits[i, dut_index, 0], track_hits[i, dut_index, 1], track_hits[i, dut_index, 2], marker='<', label=('actual track hits %i' % dut_index) if i==0 else '')
+#             for i in range(filtered_states.shape[0]):
+#                 try:
+#                     ax.scatter(filtered_states[i, dut_index - 1, 0], filtered_states[i, dut_index - 1, 1], filtered_states[i, dut_index - 1, 2], marker='P', label=('filtered_states %i' % dut_index) if i==0 else '')
+#                 except:
+#                     pass
+#             for i in range(extrapolations[:, 0].shape[0]):
+#                 ax.plot([extrapolations[i, 0], line_origins[i, 0]], [extrapolations[i, 1], line_origins[i, 1]], [extrapolations[i, 2], line_origins[i, 2]], ls='--', marker='s', label=('extraploations %i' % dut_index)  if i==0 else '')
+#             ax.set_xlabel('X Label')
+#             ax.set_ylabel('Y Label')
+#             ax.set_zlabel('Z Label')
+#             ax.set_title('CKF')
+#             plt.legend()
+#             plt.show()
+
+        # If last DUT is reached, store Kalman Filter results to array in order to use them for the final Kalman Smoother
+        if dut_index == n_duts - 1:
+            predicted_states_all_planes = predicted_states
+            predicted_state_covariances_all_planes = predicted_state_covariances
+            filtered_states_all_planes = filtered_states
+            filtered_state_covariances_all_planes = filtered_state_covariances
+            transition_matrices_all_planes = transition_matrices
+            track_hits_all_planes = track_hits_buffer
+            per_event_track_variables = per_event_track_variables_buffer
+            per_dut_track_variables = per_dut_track_variables_buffer
+
+    # Run Kalman Smoother
+    smoothed_states, _, chi2_smooth = run_kalman_smoother(
+        track_hits=track_hits_all_planes,
+        telescope=telescope,
+        select_fit_duts=select_fit_duts,
+        beam_energy=beam_energy,
+        particle_mass=particle_mass,
+        filtered_states=filtered_states_all_planes,
+        filtered_state_covariances=filtered_state_covariances_all_planes,
+        predicted_states=predicted_states_all_planes,
+        predicted_state_covariances=predicted_state_covariances_all_planes,
+        transition_matrices=transition_matrices_all_planes)
+
+    # Sum up chi2 for all planes and divide by number of hits
+    # chi2_normalized = np.nansum(chi2_smooth, axis=1) / (3 * (np.count_nonzero(~np.isnan(chi2_smooth[:, select_fit_duts]), axis=1) - 3))
+    chi2_normalized = np.nansum(chi2_smooth[:, select_fit_duts], axis=1) / (3 * (np.count_nonzero(~np.isnan(chi2_smooth[:, select_fit_duts]), axis=1) - 3))
+    per_event_track_variables[1] = chi2_normalized
+
+    # Sort chi2 (per event). Have to make sure that only within same event chi2 is sorted.
+    _, unique_event_number_indices, cnt = np.unique(per_event_track_variables[0], return_index=True, return_counts=True)
+    sorted_indices = []
+    for i in range(len(unique_event_number_indices)):
+        if i == len(unique_event_number_indices) - 1:
+            sorted_indices.append(list(np.argsort(chi2_normalized[unique_event_number_indices[i]:])))
+        else:
+            sorted_indices.append(list(np.argsort(chi2_normalized[unique_event_number_indices[i]:unique_event_number_indices[i + 1]])))
+    offset = np.repeat(unique_event_number_indices, cnt)
+    sorted_indices = list(itertools.chain.from_iterable(sorted_indices))
+    sorted_indices = np.array(sorted_indices)
+    sorted_indices += offset
+
+    # Sort tracks
+    track_hits_all_planes = track_hits_all_planes[sorted_indices, :, :]
+    per_event_track_variables = per_event_track_variables[:, sorted_indices]
+    smoothed_states = smoothed_states[sorted_indices, :, :]
+    # Now can put chi2 to array
+    per_event_track_variables[1] = chi2_normalized[sorted_indices]
+    per_dut_track_variables = per_dut_track_variables[:, sorted_indices, :]
+
+    # Select only tracks where hit is only used once (based on lowest chi2)
+    final_track_hits, final_per_event_track_variables, final_smoothed_states, final_per_dut_track_variables = _remove_duplicated_hits(
+        track_candidates=track_hits_all_planes,
+        track_estimates=smoothed_states,
+        per_event_track_variables=per_event_track_variables,
+        per_dut_track_variables=per_dut_track_variables)
+
+    # Select for every seed the best track candidate (track score/chi2)
+#     selection = _final_track_selection(track_chi2=per_event_track_variables[1],
+#                                        seed_id=per_event_track_variables[3])
+# 
+#     final_track_hits = track_hits_all_planes[selection, :, :]
+#     final_smoothed_states = smoothed_states[selection, :, :]
+#     final_per_event_track_variables = per_event_track_variables[:, selection]
+#     final_per_dut_track_variables = per_dut_track_variables[:, selection, :]
+
+#     final_track_hits = track_hits_buffer_combined
+#     final_smoothed_states = smoothed_states
+#     final_per_event_track_variables = per_event_track_variables_buffer_combined
+#     final_per_dut_track_variables = per_dut_track_variables_buffer_combined
+
+    return final_track_hits, final_smoothed_states, final_per_event_track_variables, final_per_dut_track_variables
+
+
+def run_kalman_filter(select_duts, use_kalman_filter_result, track_hits, telescope, select_fit_duts, beam_energy, particle_mass,
+                      predicted_states=None, predicted_state_covariances=None, kalman_gains=None,
+                      filtered_states=None, filtered_state_covariances=None, transition_matrices=None, chi2_filter=None):
+
+    # Initialize all needed matrices for Kalman Filter
+    ckf = prepare_ckf(
+        track_hits=track_hits,
+        telescope=telescope,
+        select_fit_duts=select_fit_duts,
+        beam_energy=beam_energy,
+        particle_mass=particle_mass)
+
+    # Run Kalman Filter
+    return ckf.filter_iterative(
+        select_duts=select_duts,
+        use_kalman_filter_result=use_kalman_filter_result,
+        observations=track_hits[:, :, 0:3],
+        predicted_states=predicted_states,
+        predicted_state_covariances=predicted_state_covariances,
+        kalman_gains=kalman_gains,
+        filtered_states=filtered_states,
+        filtered_state_covariances=filtered_state_covariances,
+        transition_matrices_update=transition_matrices,
+        chi2=chi2_filter)
+
+
+def run_kalman_smoother(track_hits, telescope, select_fit_duts, beam_energy, particle_mass, filtered_states, filtered_state_covariances, predicted_states, predicted_state_covariances, transition_matrices):
+    # Initialize all needed matrices for Kalman Filter
+    ckf = prepare_ckf(
+        track_hits=track_hits,
+        telescope=telescope,
+        select_fit_duts=select_fit_duts,
+        beam_energy=beam_energy,
+        particle_mass=particle_mass)
+
+    # store needed prediction and filter results at last DUT in order to use them for final smoothing
+    smoothed_states, smoothed_state_covariances, chi2_smooth = ckf.smooth(
+        filtered_states=filtered_states,
+        filtered_state_covariances=filtered_state_covariances,
+        predicted_states=predicted_states,
+        predicted_state_covariances=predicted_state_covariances,
+        transition_matrices=transition_matrices,
+        observations=track_hits[:, :, 0:3])
+
+    # Check for invalid values (NaN)
+    if np.any(np.isnan(smoothed_states)):
+        logging.warning('Smoothed state estimates contain invalid values (NaNs). Check input of Kalman Filter.')
+
+    return smoothed_states, smoothed_state_covariances, chi2_smooth
+
+
+def prepare_ckf(track_hits, telescope, select_fit_duts, beam_energy, particle_mass):
+    alignment = []
+    material_budget = []
+    all_dut_planes = [dut for dut in telescope]
+    for dut in all_dut_planes:
+        alignment.append([dut.translation_x, dut.translation_y, dut.translation_z, dut.rotation_alpha, dut.rotation_beta, dut.rotation_gamma])
+        # TODO: take rotation into account for material budget
+        material_budget.append(dut.material_budget)
+    alignment = np.array(alignment)
+    material_budget = np.array(material_budget)
+
+    chunk_size = track_hits.shape[0]
+    n_duts = track_hits.shape[1]
+
+    # Calculate multiple scattering
+    momentum = np.sqrt(beam_energy**2 - particle_mass**2)
+    beta = momentum / beam_energy  # almost 1
+
+    # calculating DUT indices list with z-order
+    intersections_z_axis = []
+    for dut in all_dut_planes:
+        intersections_z_axis.append(geometry_utils.get_line_intersections_with_dut(
+            line_origins=np.array([[0.0, 0.0, 0.0]]),
+            line_directions=np.array([[0.0, 0.0, 1.0]]),
+            translation_x=dut.translation_x,
+            translation_y=dut.translation_y,
+            translation_z=dut.translation_z,
+            rotation_alpha=dut.rotation_alpha,
+            rotation_beta=dut.rotation_beta,
+            rotation_gamma=dut.rotation_gamma)[0][2])
+    z_sorted_dut_indices = np.argsort(intersections_z_axis)
+
+    if np.any(np.isclose(material_budget[z_sorted_dut_indices[:-1]], 0.0)):
+        raise ValueError("Material budget is zero.")
+
+    # rms angle of multiple scattering
+    thetas = np.array(((13.6 / momentum / beta) * np.sqrt(material_budget) * (1. + 0.038 * np.log(material_budget))))
+    # error on z-position
+    z_error = 1e3  # Assume 1 mm
+
+    # express transition and observation offset matrices
+    # these are additional offsets, which are not used at the moment
+    transition_offsets = np.zeros((chunk_size, n_duts - 1, 6), dtype=np.float64)
+    observation_offsets = np.zeros((chunk_size, n_duts, 3), dtype=np.float64)
+
+    # express initial state. Contains (x_pos, y_pos, z_pos, slope_x, slope_y, slope_z).
+    initial_state_mean = np.zeros((chunk_size, 6), dtype=np.float64)
+
+    # express observation matrix, only observe (x,y,z)
+    observation_matrices = np.zeros((chunk_size, n_duts, 3, 6), dtype=np.float64)
+    observation_matrices[:, :, 0, 0] = 1.0
+    observation_matrices[:, :, 1, 1] = 1.0
+    observation_matrices[:, :, 2, 2] = 1.0
+    # express observation covariance matrices
+    observation_covariances = np.zeros((chunk_size, n_duts, 3, 3), dtype=np.float64)
+
+    # express initial state covariance matrices
+    initial_state_covariance = np.zeros((chunk_size, 6, 6), dtype=np.float64)
+    # error on initial slope is roughly divergence of beam (5 mrad).
+    initial_state_covariance[:, 3, 3] = np.square(5e-3)
+    initial_state_covariance[:, 4, 4] = np.square(5e-3)
+    initial_state_covariance[:, 5, 5] = np.square(5e-3)
+
+    for index, actual_hits in enumerate(track_hits):  # Loop over selected track candidate hits and fit
+        # Take cluster hit position error as measurement error for duts which have a hit.
+        # For those who have no hit, need no error, since the should not be included in fit via fit selection
+        duts_with_hits = np.array(range(n_duts), dtype=np.int)[~np.isnan(actual_hits[:, 0])]
+        observation_covariances[index, duts_with_hits, 0, 0] = np.square(actual_hits[duts_with_hits, 3])
+        observation_covariances[index, duts_with_hits, 1, 1] = np.square(actual_hits[duts_with_hits, 4])
+        observation_covariances[index, duts_with_hits, 2, 2] = np.square(z_error)
+        if np.isnan(actual_hits[z_sorted_dut_indices[0], 0]):  # The first plane has no hit
+            # Take planes from fit selction and fit a line to the hits,
+            # then extrapolate the line to first plane in order to find initial state.
+            # The position error is estimated with the pixel size.
+            # TODO: Can't we handle this as any other scattering plane with error=0?
+            # Edit: Any plane without hit is treated as scatter plane.
+            try:
+                # Fit all DUTs with hits
+                offset, slope = line_fit_3d(positions=actual_hits[select_fit_duts, :3])
+                # TODO: For lower energies and lighter particles use the first hit DUT as position for the first scatter plane
+                # Fit the first 2 DUTs with hits
+                # offset, slope = line_fit_3d(positions=actual_hits[z_sorted_fit_dut_indices, :3], n=2)
+            except np.linalg.linalg.LinAlgError:
+                offset, slope = np.nan, np.nan
+
+            intersections = geometry_utils.get_line_intersections_with_dut(
+                line_origins=np.array([offset]),
+                line_directions=np.array([slope]),
+                translation_x=dut.translation_x,
+                translation_y=dut.translation_y,
+                translation_z=dut.translation_z,
+                rotation_alpha=dut.rotation_alpha,
+                rotation_beta=dut.rotation_beta,
+                rotation_gamma=dut.rotation_gamma)
+
+            # The beam angle goes along the z axis (0.0, 0.0, 1.0).
+            initial_state_mean[index] = [intersections[0, 0], intersections[0, 1], intersections[0, 2], 0.0, 0.0, 1.0]
+            initial_state_covariance[index, 0, 0] = 0.0
+            initial_state_covariance[index, 1, 1] = 0.0
+            # initial_state_covariance[index, 0, 0] = np.square(first_dut_pixel_size[0])
+            # initial_state_covariance[index, 1, 1] = np.square(first_dut_pixel_size[1])
+        else:  # The first plane has a hit
+            # If first plane should be included in track building, take first dut hit as initial value and
+            # its corresponding cluster position error as the error on the measurement.
+            # The beam angle goes along the z axis (0.0, 0.0, 1.0).
+            initial_state_mean[index] = [actual_hits[z_sorted_dut_indices[0], 0], actual_hits[z_sorted_dut_indices[0], 1], actual_hits[z_sorted_dut_indices[0], 2], 0.0, 0.0, 1.0]
+            initial_state_covariance[index, 0, 0] = np.square(actual_hits[z_sorted_dut_indices[0], 3])  # x_err
+            initial_state_covariance[index, 1, 1] = np.square(actual_hits[z_sorted_dut_indices[0], 4])  # y_err
+            initial_state_covariance[index, 2, 2] = np.square(z_error)
+
+    # Init CKF
+    ckf = kalman.CombinatorialKalmanFilter(
+        dut_planes=all_dut_planes,
+        select_fit_duts=select_fit_duts,
+        thetas=thetas[:n_duts],
+        z_sorted_dut_indices=z_sorted_dut_indices,
+        transition_offsets=transition_offsets,
+        observation_matrices=observation_matrices,
+        observation_covariances=observation_covariances,
+        observation_offsets=observation_offsets,
+        initial_state_means=initial_state_mean,
+        initial_state_covariances=initial_state_covariance)
+
+    return ckf
+
+
+@njit
+def _search_hits_within_search_radius(actual_dut_hits, actual_per_event_track_variables, actual_per_dut_track_variables, possible_track_hits_old, old_per_event_track_variables, 
+                                      old_per_dut_track_variables, track_hits_buffer, per_event_track_variables_buffer, per_dut_track_variables_buffer,
+                                      n_trees, dut_index, association_distance, max_hit_multiplicity,
+                                      select_hit_duts, extrapolations, predicted_states, predicted_state_covariances,
+                                      kalman_gains, filtered_states, filtered_state_covariances, transition_matrices, chi2, fill_kf_results=False):
+    possible_track_hit_index = 0
+    # Arrays in order to store KF results of all found trees
+    predicted_states_new = np.zeros(shape=(track_hits_buffer.shape[0], predicted_states.shape[1], predicted_states.shape[2]))
+    predicted_state_covariances_new = np.zeros(shape=(track_hits_buffer.shape[0], predicted_state_covariances.shape[1],
+                                                      predicted_state_covariances.shape[2], predicted_state_covariances.shape[3]))
+    kalman_gains_new = np.zeros(shape=(track_hits_buffer.shape[0], kalman_gains.shape[1], kalman_gains.shape[2], kalman_gains.shape[3]))
+    filtered_states_new = np.zeros_like(predicted_states_new)
+    filtered_state_covariances_new = np.zeros_like(predicted_state_covariances_new)
+    transition_matrices_new = np.zeros(shape=(track_hits_buffer.shape[0], transition_matrices.shape[1],
+                                              transition_matrices.shape[2], transition_matrices.shape[3]))
+    chi2_new = np.zeros(shape=(track_hits_buffer.shape[0], chi2.shape[1]))
+    actual_event_number_extrapolation = old_per_event_track_variables[0, 0]
+
+    new_start_index = 0  # index where to search for new hits within search radius (optimized in order to start not for every event number at the beginning)
+    last_hit_index = 0  # index of last event number change (will be used as new start index)
+    start_index_is_updated = False  # variable in order to indicate if start_index is already updated. Must be only updated at beginning of one event.
+
+    extrapolations_x, extrapolations_y = extrapolations[:, 0], extrapolations[:, 1]
+    # Search for hits within search radius and fill possible tracks array
+    for tree_index in range(extrapolations_x.shape[0]):  # Loop over all trees
+        actual_extrapolation_x = extrapolations_x[tree_index]
+        actual_extrapolation_y = extrapolations_y[tree_index]
+        n_multiplicity_per_tree = 0
+        found_hit_for_actual_extrapolation = False
+        old_event_number_extrapolation = actual_event_number_extrapolation
+        actual_event_number_extrapolation = old_per_event_track_variables[0, tree_index]  # Event number of actual extrapolation
+
+        for hit_index in range(actual_dut_hits.shape[0]):  # Loop over hits in actual plane and check for matching hits.
+            if tree_index > 0:
+                if actual_event_number_extrapolation != old_event_number_extrapolation:  # Set new start index if all extrapolations of one event number are done.
+                    new_start_index = last_hit_index
+                    start_index_is_updated = False
+
+            if hit_index + new_start_index >= actual_dut_hits.shape[0] - 1:  # Go to next extrapolation if reached end of track hits
+                break
+            possible_hit = actual_dut_hits[hit_index + new_start_index]
+            actual_event_number_search_hit = actual_per_event_track_variables[0, hit_index + new_start_index]
+
+            # Check if hit is still within actual event
+            if actual_event_number_extrapolation < actual_event_number_search_hit:
+                # Reached all possible hits of same event. Thus go next extrapolation and search again. Store hit index, in order to know where new event starts.
+                if not start_index_is_updated:
+                    last_hit_index = last_hit_index + hit_index
+                    start_index_is_updated = True
+                break
+            elif actual_event_number_extrapolation > actual_event_number_search_hit:
+                continue
+            else:
+                # Check if actual hit is within search radius
+                if (np.abs(actual_extrapolation_x - possible_hit[0]) <= association_distance[0]) and (np.abs(actual_extrapolation_y - possible_hit[1]) <= association_distance[1]):
+                    if n_multiplicity_per_tree >= max_hit_multiplicity:
+                        # TODO: sort hits according to residuum and take always the best max_hit_multiplicity hits
+                        # Found maximum number of allowed hits within search radius for actual extrapolation. Thus go to next extrapolation
+                        print('WARNING: max multiplicity reached!')
+                        break
+#                         same_tree_selection = (per_event_track_variables_buffer[3, :] == tree_index)
+#                         actual_track_hits = track_hits_buffer[same_tree_selection, dut_index]
+#                         residuals_x = np.abs(actual_extrapolation_x - actual_track_hits[:, 0])
+#                         residuals_y = np.abs(actual_extrapolation_y - actual_track_hits[:, 1])
+#                         distances = np.sqrt(residuals_x**2 + residuals_y**2)
+#                         largest_distance = np.max(distances)
+#                         actual_residual_x = np.abs(actual_extrapolation_x - possible_hit[0])
+#                         actual_residual_y = np.abs(actual_extrapolation_y - possible_hit[1])
+#                         actual_distance = np.sqrt(actual_residual_x**2 + actual_residual_y**2)
+#                         if actual_distance >= largest_distance:  # only break if actual distance larger than actual distance
+#                             break
+                    # Fill hits. TODO: maybe put this into _fill function
+                    track_hits_buffer[possible_track_hit_index, :dut_index] = possible_track_hits_old[tree_index]  # Hits from planes before
+                    track_hits_buffer[possible_track_hit_index, dut_index] = possible_hit  # Fill actual hit within search radius
+                    for i in range(per_event_track_variables_buffer.shape[0]):
+                        per_event_track_variables_buffer[i, possible_track_hit_index] = old_per_event_track_variables[i, tree_index]
+                    per_event_track_variables_buffer[2, possible_track_hit_index] += (1 << dut_index)  # Set hit flag. Note: cannot use logical or since track variables contain floats like chi2.
+                    if not fill_kf_results:  # set seed ID only for first plane. For other planes, copy from array before.
+                        per_event_track_variables_buffer[3, possible_track_hit_index] = tree_index  # Set seed ID
+                    for i in range(per_dut_track_variables_buffer.shape[0]):
+                        per_dut_track_variables_buffer[i, possible_track_hit_index, :dut_index] = old_per_dut_track_variables[i, tree_index, :dut_index]
+                        per_dut_track_variables_buffer[i, possible_track_hit_index, dut_index] = actual_per_dut_track_variables[i, hit_index + new_start_index, dut_index]
+                    if fill_kf_results:  # Fill results from kalman filter for found tree
+                        predicted_states_new[possible_track_hit_index, :dut_index] = predicted_states[tree_index, :dut_index]
+                        predicted_state_covariances_new[possible_track_hit_index, :dut_index] = predicted_state_covariances[tree_index, :dut_index]
+                        kalman_gains_new[possible_track_hit_index, :dut_index] = kalman_gains[tree_index, :dut_index]
+                        filtered_states_new[possible_track_hit_index, :dut_index] = filtered_states[tree_index, :dut_index]
+                        filtered_state_covariances_new[possible_track_hit_index, :dut_index] = filtered_state_covariances[tree_index, :dut_index]
+                        transition_matrices_new[possible_track_hit_index, :dut_index] = transition_matrices[tree_index, :dut_index]
+                        chi2_new[possible_track_hit_index, :dut_index] = chi2[tree_index, :dut_index]
+                    possible_track_hit_index += 1
+                    n_multiplicity_per_tree += 1
+                    found_hit_for_actual_extrapolation = True  # found at least one hit within search radius
+
+        # Check if hit is required for this DUT. If no hit is required for this DUT and no hit was found, append np.nan to possible tracks.
+        # TODO: allow also always no dut hit for each tree
+
+        # Add missing hit (np.nan) if no hit was required (dut not in hit dut selection) or found hit but no was required (allow for every hit also no hit)
+        if (not found_hit_for_actual_extrapolation and dut_index not in select_hit_duts):# or (found_hit_for_actual_extrapolation and dut_index not in select_hit_duts):
+            track_hits_buffer[possible_track_hit_index, :dut_index] = possible_track_hits_old[tree_index]  # Hits from planes before
+            track_hits_buffer[possible_track_hit_index, dut_index] = [np.nan, np.nan, np.nan, np.nan, np.nan, np.nan]  # Fill actual hit within search radius
+            for i in range(per_event_track_variables_buffer.shape[0]):
+                per_event_track_variables_buffer[i, possible_track_hit_index] = old_per_event_track_variables[i, tree_index]
+            if not fill_kf_results:  # set seed ID only for first plane. For other planes, copy from array before.
+                per_event_track_variables_buffer[3, possible_track_hit_index] = tree_index  # Set seed ID
+            for i in range(per_dut_track_variables_buffer.shape[0]):
+                per_dut_track_variables_buffer[i, possible_track_hit_index, :dut_index] = old_per_dut_track_variables[i, tree_index, :dut_index]
+            per_dut_track_variables_buffer[0, possible_track_hit_index, dut_index] = np.nan  # Set charge to NaN
+            per_dut_track_variables_buffer[1, possible_track_hit_index, dut_index] = 0  # Set n hits to 0
+            per_dut_track_variables_buffer[2, possible_track_hit_index, dut_index] = 0  # Set cluster shape to NaN
+            per_dut_track_variables_buffer[3, possible_track_hit_index, dut_index] = 0  # Set n cluster to NaN
+
+            if fill_kf_results:  # Fill results from kalman filter for found tree
+                predicted_states_new[possible_track_hit_index, :dut_index] = predicted_states[tree_index, :dut_index]
+                predicted_state_covariances_new[possible_track_hit_index, :dut_index] = predicted_state_covariances[tree_index, :dut_index]
+                kalman_gains_new[possible_track_hit_index, :dut_index] = kalman_gains[tree_index, :dut_index]
+                filtered_states_new[possible_track_hit_index, :dut_index] = filtered_states[tree_index, :dut_index]
+                filtered_state_covariances_new[possible_track_hit_index, :dut_index] = filtered_state_covariances[tree_index, :dut_index]
+                transition_matrices_new[possible_track_hit_index, :dut_index] = transition_matrices[tree_index, :dut_index]
+                chi2_new[possible_track_hit_index, :dut_index] = chi2[tree_index, :dut_index]
+            n_multiplicity_per_tree += 1  # Did not found a hit, but tree is not dead, thus count one up
+            possible_track_hit_index += 1
+
+        n_trees += n_multiplicity_per_tree
+
+    return (n_trees, track_hits_buffer, per_event_track_variables_buffer, per_dut_track_variables_buffer,
+            predicted_states_new, predicted_state_covariances_new, kalman_gains_new,
+            filtered_states_new, filtered_state_covariances_new, transition_matrices_new, chi2_new)
+
+
+@njit
+def _check_for_good_hits(hits, actual_dut, actual_track_chi2, track_score, missing_hits, max_delta_chi2, max_delta_score, seed_ids, indices, max_missing_hits):
+    good_track_selection = np.ones(shape=(hits.shape[0]), dtype=np.bool_)
+    actual_hits = hits[:, actual_dut]
+
+    seed_index = 0
+    actual_seed_id = seed_ids[0]
+    highest_track_score = np.max(track_score[indices[seed_index]:indices[seed_index + 1]])
+    for index in range(actual_hits.shape[0]):
+        old_seed_id = actual_seed_id
+        actual_seed_id = seed_ids[index]
+        if old_seed_id != actual_seed_id:
+            seed_index += 1
+            # Update highest track score if seed has changed
+            if seed_index >= indices.shape[0] - 1:
+                highest_track_score = np.max(track_score[indices[seed_index]:])
+            else:
+                highest_track_score = np.max(track_score[indices[seed_index]:indices[seed_index + 1]])
+
+        # Check for total number of missing hits
+        if missing_hits[index] > max_missing_hits:
+            good_track_selection[index] = 0
+        # check for chi2 contribution
+        if ~np.isnan(actual_track_chi2[index]):
+            if actual_track_chi2[index] > max_delta_chi2:
+                # print hits[index, :, 0], actual_track_chi2[index], actual_dut, 'chi2'
+                good_track_selection[index] = 0
+        # check track score
+        if (highest_track_score - track_score[index]) > max_delta_score:
+            # print hits[index, :, 0], actual_track_chi2[index], highest_track_score, track_score[index], 'score'
+            good_track_selection[index] = 0
+
+    return good_track_selection
+
+
+@njit
+def _remove_duplicated_hits(track_candidates, track_estimates, per_event_track_variables, per_dut_track_variables, max_tracks_per_event=40):
+    n_duts = track_candidates.shape[1]
+    n_dim_state = track_candidates.shape[2]
+    final_tracks_buffer = np.zeros((max_tracks_per_event, n_duts, n_dim_state))  # Array in order to store final tracks per event
+    per_event_track_variables_buffer = np.zeros((per_event_track_variables.shape[0], max_tracks_per_event))  # Array in order to store final tracks per event
+    track_estimates_buffer = np.zeros((max_tracks_per_event, n_duts, n_dim_state))
+    per_dut_track_variables_buffer = np.zeros((per_dut_track_variables.shape[0], max_tracks_per_event, n_duts))  # Array in order to store final tracks per event
+
+    init = True
+    found_first_track = False
+    final_tracks_buffer_index = 0
+    actual_event_number = per_event_track_variables[0, 0]
+    for track_index in range(track_candidates.shape[0]):  # Loop over hits
+        old_event_number = actual_event_number
+        actual_event_number = per_event_track_variables[0, track_index]
+
+        if actual_event_number != old_event_number:  # Have checked all hits of same event
+            # Set number of tracks per event
+            per_event_track_variables_buffer[3, :] = final_tracks_buffer_index + 1
+            # Write found tracks to result array
+            if init:
+                final_tracks = final_tracks_buffer[:final_tracks_buffer_index]
+                final_per_event_track_variables = per_event_track_variables_buffer[:, :final_tracks_buffer_index]
+                final_track_estimates = track_estimates_buffer[:final_tracks_buffer_index]
+                final_per_dut_track_variables = per_dut_track_variables_buffer[:, :final_tracks_buffer_index, :]
+                init = False
+            else:
+                final_tracks = np.concatenate((final_tracks, final_tracks_buffer[:final_tracks_buffer_index]), axis=0)
+                final_per_event_track_variables = np.concatenate((final_per_event_track_variables, per_event_track_variables_buffer[:, :final_tracks_buffer_index]), axis=1)
+                final_track_estimates = np.concatenate((final_track_estimates, track_estimates_buffer[:final_tracks_buffer_index]), axis=0)
+                final_per_dut_track_variables = np.concatenate((final_per_dut_track_variables, per_dut_track_variables_buffer[:, :final_tracks_buffer_index, :]), axis=1)
+            # Reset used tracks per event
+            final_tracks_buffer = np.zeros((max_tracks_per_event, n_duts, n_dim_state))
+            per_event_track_variables_buffer = np.zeros((per_event_track_variables.shape[0], max_tracks_per_event))  # Array in order to store final tracks per event
+            track_estimates_buffer = np.zeros((max_tracks_per_event, n_duts, n_dim_state))
+            per_dut_track_variables_buffer = np.zeros((per_dut_track_variables.shape[0], max_tracks_per_event, n_duts))
+            final_tracks_buffer_index = 0
+            found_first_track = False
+
+        if not found_first_track:
+            final_tracks_buffer[final_tracks_buffer_index] = track_candidates[track_index]
+            track_estimates_buffer[final_tracks_buffer_index] = track_estimates[track_index]
+            for i in range(per_event_track_variables_buffer.shape[0]):
+                per_event_track_variables_buffer[i, final_tracks_buffer_index] = per_event_track_variables[i, track_index]
+            for i in range(per_dut_track_variables_buffer.shape[0]):
+                per_dut_track_variables_buffer[i, final_tracks_buffer_index] = per_dut_track_variables[i, track_index]
+            final_tracks_buffer_index += 1
+            found_first_track = True
+        else:  # Check if actual track has already used hit
+            has_used_hit = False
+            for dut_index in range(n_duts):  # Loop over all planes
+                actual_x = track_candidates[track_index, dut_index, 0]
+                actual_y = track_candidates[track_index, dut_index, 1]
+                if actual_x in list(final_tracks_buffer[:, dut_index, 0]) and actual_y in list(final_tracks_buffer[:, dut_index, 1]):  # Track has already used hit
+                    has_used_hit = True
+                    break  # Exit loop in order to continue with next tracks since found alreay a used hit
+                else:  # Check next plane
+                    continue
+
+            if not has_used_hit:  # No hit of actual track was used before. Thus write it to final track array
+                if final_tracks_buffer_index >= max_tracks_per_event - 1:
+                    break
+                else:
+                    final_tracks_buffer[final_tracks_buffer_index] = track_candidates[track_index]
+                    track_estimates_buffer[final_tracks_buffer_index] = track_estimates[track_index]
+                    for i in range(per_event_track_variables_buffer.shape[0]):
+                        per_event_track_variables_buffer[i, final_tracks_buffer_index] = per_event_track_variables[i, track_index]
+                    for i in range(per_dut_track_variables_buffer.shape[0]):
+                        per_dut_track_variables_buffer[i, final_tracks_buffer_index] = per_dut_track_variables[i, track_index]
+                    final_tracks_buffer_index += 1
+
+    return final_tracks, final_per_event_track_variables, final_track_estimates, final_per_dut_track_variables
+
+
+@njit
+def _final_track_selection(track_chi2, seed_id):
+    selection = np.zeros(shape=track_chi2.shape[0], dtype=np.bool_)
+
+    actual_seed_id = seed_id[0]
+    for index in range(track_chi2.shape[0]):
+        old_seed_id = actual_seed_id
+        actual_seed_id = seed_id[index]
+        actual_track_chi2 = track_chi2[index]
+
+        if index == 0 or actual_seed_id != old_seed_id:  # set first track candidate as best candidate for very first track or if new seed id
+            best_track_chi2 = track_chi2[index]
+            best_track_index = index
+            selection[index] = 1  # set new best track
+            continue
+
+        if np.abs(actual_track_chi2 - best_track_chi2) < 1:  # Unset best track candidate if chi2 too close
+            selection[best_track_index] = 0  # Unset best track candidate
+            best_track_index = index
+            best_track_chi2 = track_chi2[index]
+
+        if actual_track_chi2 < best_track_chi2:
+            selection[index] = 1  # set new best track
+            selection[best_track_index] = 0  # remove old track
+            best_track_index = index
+            best_track_chi2 = track_chi2[index]
+
+    return selection
